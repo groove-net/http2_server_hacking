@@ -1,7 +1,7 @@
 #ifndef ENGINE_INTERNAL_H
 #define ENGINE_INTERNAL_H
 
-#include "../../include/async_engine.h"
+#include "async_engine.h"
 #include <stdatomic.h>
 #include <stddef.h>
 

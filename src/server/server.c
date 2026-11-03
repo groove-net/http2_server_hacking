@@ -1,8 +1,8 @@
-#include "../../include/server.h"
-#include "../../include/async_engine.h"
-#include "../../include/config.h"
-#include "../../include/custring.h"
-#include "../../include/liblog.h"
+#include "server.h"
+#include "async_engine.h"
+#include "config.h"
+#include "custring.h"
+#include "liblog.h"
 #include "client_session.c"
 #include "create_listener_socket.c"
 #include <netdb.h>

@@ -1,8 +1,12 @@
+> **Historical document.** This file describes an earlier architecture and API.
+> For the current server, use `include/http2_server.h`, `include/http_exchange.h`,
+> and the `src/http_mw_*` middleware modules.
+
 # TLS transport integration — exhaustive diff guide
 
 This document describes every added and modified line in the server module for
-the TLS transport work. The TLS module itself is new (`include/tls.h`,
-`src/tls/tls.c`), so it has no old version to diff.
+the TLS transport work. The TLS module itself is new (`include/tls_server.h`,
+`src/tls_server/tls_server.c`), so it has no old version to diff.
 
 ## What changed conceptually
 
@@ -44,10 +48,10 @@ owner of socket reads. HTTP/2 never sees encrypted bytes.
 | `src/server/client_session.c` | 174 | 11 |
 | `src/server/server.c` | 8 | 0 |
 | `src/http2/http2.c` | 49 | 18 |
-| `include/http2.h` | 46 | 16 |
+| `include/http2_server.h` | 46 | 16 |
 | `Makefile` | 4 | 2 |
-| **New `include/tls.h`** | 138 | — |
-| **New `src/tls/tls.c`** | 358 | — |
+| **New `include/tls_server.h`** | 138 | — |
+| **New `src/tls_server/tls_server.c`** | 358 | — |
 
 Only **11 old lines** are removed in the server module. They are replaced by the
 four modified blocks explained below. Everything else in the server module is
@@ -185,8 +189,8 @@ freed before the engine closes the fd.
 @@ -1,6 +1,7 @@
  #include "../../include/async_engine.h"
  #include "../../include/config.h"
- #include "../../include/http2.h"
-+#include "../../include/tls.h"
+ #include "../../include/http2_server.h"
++#include "../../include/tls_server.h"
  #include <limits.h>
  #include <netinet/in.h>
  #include <netinet/tcp.h>
@@ -654,11 +658,11 @@ original `write()`/`writev()` when no transport was installed. The constructor
 body was renamed to a private implementation; the old public constructor remains
 as a thin wrapper, so existing callers are unaffected.
 
-### `include/http2.h`
+### `include/http2_server.h`
 
 ```diff
---- a/include/http2.h
-+++ b/include/http2.h
+--- a/include/http2_server.h
++++ b/include/http2_server.h
 @@ -40,9 +40,13 @@
  #include <nghttp2/nghttp2.h>
  #include <stddef.h>
@@ -782,7 +786,7 @@ as a thin wrapper, so existing callers are unaffected.
 
 ## New TLS module
 
-`include/tls.h` exposes an opaque `tls_config_t` and `tls_conn_t` with:
+`include/tls_server.h` exposes an opaque `tls_config_t` and `tls_conn_t` with:
 
 - config creation/free and certificate/key loading;
 - handshake driving with ALPN `h2` validation;
@@ -791,7 +795,7 @@ as a thin wrapper, so existing callers are unaffected.
 - encrypted-output flushing and pending-byte inspection;
 - shutdown and EOF/wants-read queries.
 
-`src/tls/tls.c` implements this with OpenSSL memory BIOs. It keeps encrypted
+`src/tls_server/tls_server.c` implements this with OpenSSL memory BIOs. It keeps encrypted
 output in a bounded 4 MiB buffer. `tls_conn_write()` returns 0 when that buffer is
 full, which becomes HTTP/2 `WOULDBLOCK`; the server then waits for writability and
 flushes. This provides backpressure without changing the HTTP/2 response API.

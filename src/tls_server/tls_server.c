@@ -1,5 +1,5 @@
-#include "../../include/tls.h"
-#include "../../include/liblog.h"
+#include "tls_server.h"
+#include "liblog.h"
 #include <errno.h>
 #include <limits.h>
 #include <openssl/err.h>
@@ -13,6 +13,8 @@
 
 struct tls_config {
   SSL_CTX *ctx;
+  uint8_t protos[256];
+  size_t protos_len;
 };
 
 struct tls_conn {
@@ -39,10 +41,12 @@ static int tls_alpn_select(SSL *ssl, const unsigned char **out,
                            unsigned char *outlen, const unsigned char *in,
                            unsigned int inlen, void *arg) {
   (void)ssl;
-  (void)arg;
-  static const unsigned char protos[] = {2, 'h', '2'};
-  int rc = SSL_select_next_proto((unsigned char **)out, outlen, protos,
-                                 sizeof protos, in, inlen);
+  tls_config_t *cfg = arg;
+  if (cfg == NULL || cfg->protos_len == 0) {
+    return SSL_TLSEXT_ERR_NOACK;
+  }
+  int rc = SSL_select_next_proto((unsigned char **)out, outlen, cfg->protos,
+                                 (unsigned int)cfg->protos_len, in, inlen);
   if (rc != OPENSSL_NPN_NEGOTIATED) {
     return SSL_TLSEXT_ERR_ALERT_FATAL;
   }
@@ -65,7 +69,9 @@ tls_config_t *tls_config_new(const char *cert_file, const char *key_file) {
   }
   SSL_CTX_set_min_proto_version(cfg->ctx, TLS1_2_VERSION);
   SSL_CTX_set_options(cfg->ctx, SSL_OP_NO_COMPRESSION | SSL_OP_NO_RENEGOTIATION);
-  SSL_CTX_set_alpn_select_cb(cfg->ctx, tls_alpn_select, NULL);
+  cfg->protos_len = 3;
+  memcpy(cfg->protos, "\x02h2", 3);
+  SSL_CTX_set_alpn_select_cb(cfg->ctx, tls_alpn_select, cfg);
   if (SSL_CTX_use_certificate_chain_file(cfg->ctx, cert_file) != 1) {
     tls_log_ssl("SSL_CTX_use_certificate_chain_file");
     SSL_CTX_free(cfg->ctx);
@@ -85,6 +91,17 @@ tls_config_t *tls_config_new(const char *cert_file, const char *key_file) {
     return NULL;
   }
   return cfg;
+}
+
+int tls_config_set_alpn(tls_config_t *cfg, const uint8_t *protos, size_t len) {
+  if (cfg == NULL || (len > 0 && protos == NULL) || len > sizeof cfg->protos) {
+    return -1;
+  }
+  cfg->protos_len = len;
+  if (len > 0) {
+    memcpy(cfg->protos, protos, len);
+  }
+  return 0;
 }
 
 void tls_config_free(tls_config_t *cfg) {
@@ -158,13 +175,6 @@ int tls_conn_handshake(tls_conn_t *tls) {
   tls->wants_read = 0;
   int rc = SSL_do_handshake(tls->ssl);
   if (rc == 1) {
-    const unsigned char *proto = NULL;
-    unsigned int plen = 0;
-    SSL_get0_alpn_selected(tls->ssl, &proto, &plen);
-    if (proto == NULL || plen != 2 || memcmp(proto, "h2", 2) != 0) {
-      log_error("[tls] client did not negotiate h2 via ALPN");
-      return -1;
-    }
     tls->handshake_done = 1;
     return 1;
   }

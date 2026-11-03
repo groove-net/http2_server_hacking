@@ -55,6 +55,10 @@ typedef struct tls_conn tls_conn_t;
  * shared by connections and must outlive them. */
 tls_config_t *tls_config_new(const char *cert_file, const char *key_file);
 
+/* Set the ALPN protocols advertised/selected. `protos` is a length-prefixed
+ * concatenation (e.g. "\x02h2"). Empty disables ALPN. */
+int tls_config_set_alpn(tls_config_t *cfg, const uint8_t *protos, size_t len);
+
 /* Release a configuration. Do not call while any tls_conn_t created from it is
  * still alive. */
 void tls_config_free(tls_config_t *cfg);

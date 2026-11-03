@@ -88,6 +88,10 @@ int task_setup_read(io_task_t *task, uint8_t *read_buffer, size_t read_size);
 // arguments or a missing worker.
 int task_start_read(io_task_t *task);
 
+// Arm write readiness without an active write. Used for nonblocking connect
+// and protocols that want to wait for writability before producing output.
+void task_wait_write(io_task_t *task);
+
 // Stop read interest without completing the task. Buffered bytes remain
 // available to the handler, and the write side continues. Idempotent.
 void task_stop_read(io_task_t *task);

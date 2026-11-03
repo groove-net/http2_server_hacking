@@ -1,0 +1,127 @@
+[
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/async_engine/async_engine.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/async_engine/async_engine.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/async_engine/epoll_backend.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/async_engine/epoll_backend.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/async_engine/uring_backend.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/async_engine/uring_backend.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/compress/compress.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/compress/compress.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/example_client_streaming_request.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/example_client_streaming_request.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/example_client_unary_request.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/example_client_unary_request.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/flow_control/flow_control.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/flow_control/flow_control.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http2_client/http2_client.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http2_client/http2_client.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http2_client/http2_client_task.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http2_client/http2_client_task.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http2_server/http2_server.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http2_server/http2_server.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_middleware/http_middleware.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_middleware/http_middleware.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_body/http_mw_body.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_body/http_mw_body.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_body_limits/http_mw_body_limits.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_body_limits/http_mw_body_limits.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_compression/http_mw_compression.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_compression/http_mw_compression.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_limits/http_mw_limits.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_limits/http_mw_limits.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_logging/http_mw_logging.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_logging/http_mw_logging.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_queue_limits/http_mw_queue_limits.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_queue_limits/http_mw_queue_limits.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_router/http_mw_router.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_router/http_mw_router.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/http_mw_writer/http_mw_writer.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/http_mw_writer/http_mw_writer.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/main.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/main.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/server/client_session.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/server/client_session.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/server/create_listener_socket.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/server/create_listener_socket.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/server/server.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/server/server.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/tls_client/tls_client.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/tls_client/tls_client.c"
+  },
+  {
+    "directory": "/home/groove/Work/tcp_server_hacking",
+    "file": "/home/groove/Work/tcp_server_hacking/src/tls_server/tls_server.c",
+    "command": "clang -Wall -Wextra -Werror -pedantic -std=c11 -g -fsanitize=address -Iinclude -Isrc -D_GNU_SOURCE -D_XOPEN_SOURCE=700 -c src/tls_server/tls_server.c"
+  }
+]

@@ -1,7 +1,8 @@
-#include "../../include/async_engine.h"
-#include "../../include/config.h"
-#include "../../include/http2.h"
-#include "../../include/tls.h"
+#include "async_engine.h"
+#include "config.h"
+#include "http2_server.h"
+#include "liblog.h"
+#include "tls_server.h"
 #include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -26,8 +27,6 @@ static uint64_t g_keepalive_ms = 0;
 static uint64_t g_keepalive_timeout_ms = 10000;
 static uint32_t g_stream_window = HTTP2_DEFAULT_WINDOW_SIZE;
 static uint32_t g_connection_window = 4194304;
-static size_t g_unary_budget = 33554432;         /* per connection */
-static size_t g_global_unary_budget = 268435456; /* process-wide */
 static tls_config_t *g_tls_config = NULL;
 
 typedef struct client_ctx {
@@ -88,14 +87,6 @@ static uint32_t env_window(const char *name, uint32_t def) {
   return (uint32_t)v;
 }
 
-static size_t env_size(const char *name, size_t def) {
-  uint64_t v = env_u64(name, def);
-  if (v > (uint64_t)SIZE_MAX) {
-    v = (uint64_t)SIZE_MAX;
-  }
-  return (size_t)v;
-}
-
 void server_limits_init(void) {
   uint64_t mc = env_u64("H2_MAX_CONNECTIONS", 10000);
   g_max_conn = mc > (uint64_t)INT_MAX ? INT_MAX : (int)mc;
@@ -107,11 +98,9 @@ void server_limits_init(void) {
   if (g_keepalive_timeout_ms == 0) {
     g_keepalive_timeout_ms = g_keepalive_ms;
   }
-  g_stream_window = env_window("H2_INITIAL_WINDOW_SIZE", HTTP2_DEFAULT_WINDOW_SIZE);
+  g_stream_window =
+      env_window("H2_INITIAL_WINDOW_SIZE", HTTP2_DEFAULT_WINDOW_SIZE);
   g_connection_window = env_window("H2_CONN_WINDOW_SIZE", 4194304);
-  g_unary_budget = env_size("H2_MAX_UNARY_BYTES_PER_CONN", 33554432);
-  g_global_unary_budget = env_size("H2_MAX_UNARY_BYTES", 268435456);
-  http2_set_global_unary_budget(g_global_unary_budget);
 }
 
 int server_tls_init(void) {
@@ -232,8 +221,8 @@ static void client_idle_timer(void *arg) {
     return;
   }
 
-  ctx->idle_timer = io_timer_add(io_loop_current(), g_idle_ms,
-                                 client_idle_timer, ctx);
+  ctx->idle_timer =
+      io_timer_add(io_loop_current(), g_idle_ms, client_idle_timer, ctx);
 }
 
 static void server_tick(io_loop_t *loop) {
@@ -343,8 +332,6 @@ static void server_tick(io_loop_t *loop) {
       ctx = next;
     }
   }
-
-
 }
 
 static void server_house_timer(void *arg);
@@ -370,6 +357,7 @@ static void server_stop(io_loop_t *loop) {
 
 void my_mid_flight_handler(io_task_t *task);
 void my_continuation_callback(void *context, int status, uint8_t *buffer);
+
 
 static ssize_t client_tls_write(void *context, const uint8_t *buf, size_t len) {
   return tls_conn_write(context, buf, len);
@@ -550,13 +538,11 @@ void my_mid_flight_handler(io_task_t *task) {
       }
       if (!hs) {
         if (task->read_closed) {
-          task->state = tls_conn_pending_out(ctx->tls) != 0
-                            ? TASK_WAIT_WRITE
-                            : TASK_COMPLETED;
+          task->state = tls_conn_pending_out(ctx->tls) != 0 ? TASK_WAIT_WRITE
+                                                            : TASK_COMPLETED;
         } else {
-          task->state = tls_conn_pending_out(ctx->tls) != 0
-                            ? TASK_WAIT_WRITE
-                            : TASK_ACTIVE;
+          task->state = tls_conn_pending_out(ctx->tls) != 0 ? TASK_WAIT_WRITE
+                                                            : TASK_ACTIVE;
         }
         return;
       }
@@ -571,16 +557,16 @@ void my_mid_flight_handler(io_task_t *task) {
           .write = client_tls_write,
           .writev = client_tls_writev,
       };
-      ctx->h2 = http2_session_new_transport(&transport, task->fd,
-                                            g_stream_window, g_connection_window);
+      ctx->h2 = http2_session_new_transport(
+          &transport, task->fd, g_stream_window, g_connection_window);
     } else {
-      ctx->h2 = http2_session_new(task->fd, g_stream_window, g_connection_window);
+      ctx->h2 =
+          http2_session_new(task->fd, g_stream_window, g_connection_window);
     }
     if (ctx->h2 == NULL) {
       task->state = TASK_COMPLETED;
       return;
     }
-    http2_session_set_unary_budget(ctx->h2, g_unary_budget);
   }
 
   if (ctx->tls != NULL) {
@@ -595,8 +581,8 @@ void my_mid_flight_handler(io_task_t *task) {
     size_t span = task_read_span(task);
     const uint8_t *head = task->read_buffer + task->read_head;
     if (http2_session_feed(ctx->h2, head, span) != 0 ||
-        (span < buffered &&
-         http2_session_feed(ctx->h2, task->read_buffer, buffered - span) != 0)) {
+        (span < buffered && http2_session_feed(ctx->h2, task->read_buffer,
+                                               buffered - span) != 0)) {
       task->state = TASK_COMPLETED;
       return;
     }
@@ -628,8 +614,7 @@ void my_mid_flight_handler(io_task_t *task) {
   task->state = want_write ? TASK_WAIT_WRITE : TASK_ACTIVE;
 }
 
-void my_continuation_callback(void *context, int status,
-                              uint8_t *read_buffer) {
+void my_continuation_callback(void *context, int status, uint8_t *read_buffer) {
   (void)status;
 
   client_ctx_t *ctx = context;

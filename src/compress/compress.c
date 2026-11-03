@@ -1,4 +1,4 @@
-#include "../../include/compress.h"
+#include "compress.h"
 #include <brotli/decode.h>
 #include <brotli/encode.h>
 #include <limits.h>

@@ -1,7 +1,11 @@
+> **Historical document.** This file describes an earlier architecture and API.
+> For the current server, use `include/http2_server.h`, `include/http_exchange.h`,
+> and the `src/http_mw_*` middleware modules.
+
 # The HTTP/2 Library, From Scratch
 
 This is the HTTP/2 companion to the async-engine tutorial. It builds the neutral
-HTTP/2 server layer in `include/http2.h` and `src/http2/http2.c` one decision at
+HTTP/2 server layer in `include/http2_server.h` and `src/http2/http2.c` one decision at
 a time.
 
 The destination is a library, not a `main()` program:
@@ -1065,15 +1069,17 @@ For every complete message:
 Collect messages into a batch and hand the batch to the handler. Bound the batch
 at `HTTP2_BATCH_MAX` messages so one huge chunk cannot monopolize the worker.
 
-An incomplete tail stays in `st->body`. Cap it with `HTTP2_MAX_RESIDUAL`; a peer
-must not be able to grow the residual without bound.
+An incomplete tail stays in `st->body`. A streaming route must set
+`http2_route_t.max_message_size`; the module allocates one fixed residual buffer
+of that size when the route is bound to the stream. The buffer never grows or
+doubles. A complete message longer than the configured maximum, or a leftover
+tail that would fill the buffer, resets the stream.
 
 The residual is stored as a ring: `body_head` is the first live byte and
 `body_len` is the live length. Consuming messages advances the head; only the
 new-chunk tail is appended, so the old residual is not memmoved on every chunk.
 If the live region wraps, it is rotated back to offset zero when the framing
-view is built. Compaction or growth happens only when the live bytes no longer
-fit:
+view is built. Appending is a hard-cap operation; overflow is a protocol error:
 
 ```c
 static void reverse_bytes(uint8_t *p, size_t n) {
@@ -1099,40 +1105,12 @@ static void ring_linearize(http2_stream_t *st) {
   st->body_head = 0;
 }
 
-static void ring_compact(http2_stream_t *st) {
-  if (st->body_head == 0) {
-    return;
-  }
-  ring_linearize(st);
-  if (st->body_head != 0) {
-    memmove(st->body, st->body + st->body_head, st->body_len);
-    st->body_head = 0;
-  }
-}
-
 static int ring_append(http2_stream_t *st, const uint8_t *src, size_t n) {
   if (n == 0) {
     return 0;
   }
-  size_t need = st->body_len + n;
-  if (need > st->body_cap) {
-    ring_compact(st);
-    if (need > st->body_cap) {
-      size_t cap = st->body_cap != 0 ? st->body_cap : 256;
-      while (cap < need) {
-        if (cap > SIZE_MAX / 2) {
-          cap = need;
-          break;
-        }
-        cap *= 2;
-      }
-      uint8_t *grown = realloc(st->body, cap);
-      if (grown == NULL) {
-        return -1;
-      }
-      st->body = grown;
-      st->body_cap = cap;
-    }
+  if (st->body_cap == 0 || n > st->body_cap - st->body_len) {
+    return -1;
   }
   size_t tail = (st->body_head + st->body_len) % st->body_cap;
   size_t first = st->body_cap - tail;
@@ -1379,7 +1357,7 @@ Phase 8 closes the library and shows how to use it.
 
 ### Step 8.1 — The final public surface
 
-The final header is `include/http2.h`. Its public groups are:
+The final header is `include/http2_server.h`. Its public groups are:
 
 ```c
 /* session */
@@ -1439,6 +1417,12 @@ int http2_stream_consume(http2_session_t *s, int32_t sid, size_t n);
 void http2_set_global_unary_budget(size_t bytes);
 int http2_session_set_unary_budget(http2_session_t *s, size_t bytes);
 size_t http2_session_unary_bytes(const http2_session_t *s);
+void http2_set_global_queue_limit(size_t bytes);
+void http2_set_tenant_queue_limit(size_t bytes);
+int http2_session_set_queue_limits(http2_session_t *s, size_t stream_limit,
+                                   size_t connection_limit);
+size_t http2_session_queued_bytes(const http2_session_t *s);
+int http2_session_set_tenant_id(http2_session_t *s, uint64_t tenant_id);
 uint64_t http2_session_app_activity(const http2_session_t *s);
 size_t http2_session_active_streams(const http2_session_t *s);
 int http2_session_shutdown_notice(http2_session_t *s);
@@ -1468,6 +1452,11 @@ trigger/amount policy. `http2_session_set_flow_profile()` applies to streams
 created after the call; existing streams keep their profile. A route may set
 `http2_route_t.flow_profile` to override the session profile, with
 `HTTP2_FLOW_INHERIT` meaning "use the session profile".
+
+Streaming routes must also set `http2_route_t.max_message_size`. The module
+allocates one fixed residual buffer of that size per streaming stream; it does
+not grow by doubling. A complete message larger than that maximum, or an
+incomplete tail that would fill the buffer, resets the stream.
 
 ### Flow-control adapter
 
@@ -1609,6 +1598,193 @@ unary and residual bytes are reported when the module accepts them, attached
 streaming batches after the handler returns, and detached batches when the app
 calls `http2_batch_consume()`. The adapter applies stream and connection credits
 separately.
+
+### Static route compression
+
+Compression is selected statically per route and applies to both request and
+response streams. It does not use HTTP `Content-Encoding` or `Accept-Encoding`;
+both peers must share the route contract.
+
+```c
+typedef enum {
+  HTTP2_COMPRESSION_OFF = 0,
+  HTTP2_COMPRESSION_GZIP,
+  HTTP2_COMPRESSION_ZSTD,
+  HTTP2_COMPRESSION_BROTLI,
+} http2_compression_t;
+
+typedef enum {
+  HTTP2_COMPRESSION_FAST = 0,
+  HTTP2_COMPRESSION_BALANCED,
+  HTTP2_COMPRESSION_BEST,
+} http2_compression_profile_t;
+```
+
+A compressed route decompresses request DATA before prefix extraction and
+`msg_framing`, then compresses the entire response byte stream. Unary and
+streaming use the same policy; there is no per-message flag or size threshold.
+The entire request stream is capped at `HTTP2_MAX_DECOMPRESSED`, while unary
+requests also remain bounded by `HTTP2_MAX_BODY`.
+
+### Outbound response-queue limits
+
+Outbound payload bytes are capped at four levels: stream, connection, tenant,
+and process. Limits are checked before a response node is queued; exceeding any
+level fails the submission and the caller resets the stream. Structural control
+frames such as RST_STREAM and GOAWAY are not part of the payload queue. The
+tenant key is typically a hash of the peer IP, so all connections from the same
+IP share one quota.
+
+```c
+static size_t h2_queue_limit(size_t value, size_t fallback) {
+  return value != 0 ? value : fallback;
+}
+
+static uint32_t h2_tenant_bucket(uint64_t id) {
+  id ^= id >> 33;
+  id *= 0xff51afd7ed558ccdULL;
+  id ^= id >> 33;
+  return (uint32_t)(id & (H2_TENANT_BUCKETS - 1));
+}
+
+static int h2_queue_charge(uint64_t tenant, size_t n) {
+  if (n == 0) {
+    return 0;
+  }
+  pthread_mutex_lock(&g_queue_mu);
+  if (g_global_queued > g_global_queue_limit ||
+      n > g_global_queue_limit - g_global_queued) {
+    pthread_mutex_unlock(&g_queue_mu);
+    return -1;
+  }
+
+  h2_tenant_entry_t *entry = NULL;
+  uint32_t bucket = 0;
+  int created = 0;
+  if (tenant != 0) {
+    bucket = h2_tenant_bucket(tenant);
+    for (entry = g_tenants[bucket]; entry != NULL; entry = entry->next) {
+      if (entry->id == tenant) {
+        break;
+      }
+    }
+    if (entry == NULL) {
+      entry = calloc(1, sizeof *entry);
+      if (entry == NULL) {
+        pthread_mutex_unlock(&g_queue_mu);
+        return -1;
+      }
+      entry->id = tenant;
+      entry->next = g_tenants[bucket];
+      g_tenants[bucket] = entry;
+      created = 1;
+    }
+    if (entry->bytes > g_tenant_queue_limit ||
+        n > g_tenant_queue_limit - entry->bytes) {
+      if (created) {
+        g_tenants[bucket] = entry->next;
+        free(entry);
+      }
+      pthread_mutex_unlock(&g_queue_mu);
+      return -1;
+    }
+  }
+
+  g_global_queued += n;
+  if (entry != NULL) {
+    entry->bytes += n;
+  }
+  pthread_mutex_unlock(&g_queue_mu);
+  return 0;
+}
+
+static void h2_queue_release(uint64_t tenant, size_t n) {
+  if (n == 0) {
+    return;
+  }
+  pthread_mutex_lock(&g_queue_mu);
+  g_global_queued = n <= g_global_queued ? g_global_queued - n : 0;
+  if (tenant != 0) {
+    uint32_t bucket = h2_tenant_bucket(tenant);
+    h2_tenant_entry_t **link = &g_tenants[bucket];
+    while (*link != NULL) {
+      h2_tenant_entry_t *entry = *link;
+      if (entry->id == tenant) {
+        entry->bytes = n <= entry->bytes ? entry->bytes - n : 0;
+        if (entry->bytes == 0) {
+          *link = entry->next;
+          free(entry);
+        }
+        break;
+      }
+      link = &entry->next;
+    }
+  }
+  pthread_mutex_unlock(&g_queue_mu);
+}
+
+static int h2_queue_fits(const http2_session_t *s, const http2_stream_t *st,
+                         size_t n) {
+  if (n > s->stream_queue_limit ||
+      st->queued_bytes > s->stream_queue_limit - n) {
+    return 0;
+  }
+  if (n > s->connection_queue_limit ||
+      s->queued_bytes > s->connection_queue_limit - n) {
+    return 0;
+  }
+  return 1;
+}
+
+void http2_set_global_queue_limit(size_t bytes) {
+  pthread_mutex_lock(&g_queue_mu);
+  g_global_queue_limit = h2_queue_limit(bytes, HTTP2_DEFAULT_GLOBAL_QUEUE);
+  pthread_mutex_unlock(&g_queue_mu);
+}
+
+void http2_set_tenant_queue_limit(size_t bytes) {
+  pthread_mutex_lock(&g_queue_mu);
+  g_tenant_queue_limit = h2_queue_limit(bytes, HTTP2_DEFAULT_TENANT_QUEUE);
+  pthread_mutex_unlock(&g_queue_mu);
+}
+
+int http2_session_set_queue_limits(http2_session_t *s, size_t stream_limit,
+                                   size_t connection_limit) {
+  if (s == NULL) {
+    return -1;
+  }
+  h2_require_owner(s);
+  stream_limit = h2_queue_limit(stream_limit, HTTP2_DEFAULT_STREAM_QUEUE);
+  connection_limit =
+      h2_queue_limit(connection_limit, HTTP2_DEFAULT_CONNECTION_QUEUE);
+  if (connection_limit < stream_limit) {
+    return -1;
+  }
+  s->stream_queue_limit = stream_limit;
+  s->connection_queue_limit = connection_limit;
+  return 0;
+}
+
+size_t http2_session_queued_bytes(const http2_session_t *s) {
+  return s != NULL ? s->queued_bytes : 0;
+}
+
+int http2_session_set_tenant_id(http2_session_t *s, uint64_t tenant_id) {
+  if (s == NULL) {
+    return -1;
+  }
+  h2_require_owner(s);
+  if (s->queued_bytes != 0) {
+    return -1;
+  }
+  s->tenant_id = tenant_id;
+  return 0;
+}
+```
+
+`http2_session_queued_bytes()` is useful for application-side backpressure:
+stop producing when the connection is near its limit instead of waiting for the
+next enqueue to fail.
 
 ### Step 8.2 — Register routes
 

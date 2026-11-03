@@ -219,6 +219,7 @@ void task_ready(io_task_t *task) {
 }
 
 static int task_update_read_watch(io_task_t *task, int enable);
+static int task_update_write_watch(io_task_t *task, int enable);
 
 int task_setup_read(io_task_t *task, uint8_t *read_buffer, size_t read_size) {
   if (task == NULL || read_buffer == NULL || read_size == 0) {
@@ -261,6 +262,14 @@ int task_start_read(io_task_t *task) {
     task_kick(task);
   }
   return 0;
+}
+
+void task_wait_write(io_task_t *task) {
+  if (task == NULL || task->state == TASK_COMPLETED) {
+    return;
+  }
+  task->state = TASK_WAIT_WRITE;
+  task_update_write_watch(task, 1);
 }
 
 void task_stop_read(io_task_t *task) {

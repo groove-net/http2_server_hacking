@@ -223,10 +223,17 @@ the compressed/uncompressed flag per message.
 
 ## Current status
 
-The library and its build dependencies are added:
+Compression is integrated as HTTP middleware, not inside the HTTP/2 core:
 
-- zlib
-- libzstd
-- libbrotlienc / libbrotlidec
+- `http_mw_compression` implements request decompression and response compression.
+- `http_exchange_t.compression` selects off/gzip/zstd/brotli.
+- `http_exchange_t.compression_profile` selects fast/balanced/best.
+- `http_exchange_t.max_decompressed` bounds decoder output.
+- The middleware transforms DATA spans, so body framing and handlers see decoded
+  request bytes and the writer sees encoded response bytes.
+- No `Content-Encoding` or `Accept-Encoding` headers are used; both peers share
+  the route contract.
 
-It is not yet wired into `http2.c`, the server, or any response API.
+The demo routes currently leave compression off. Enabling it requires setting
+the exchange compression policy from the router/application layer. There is no
+runtime negotiation, so mismatched deployments will fail to decode bodies.

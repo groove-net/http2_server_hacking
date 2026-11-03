@@ -1,8 +1,7 @@
-#include "../../include/custring.h"
+#include "custring.h"
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>

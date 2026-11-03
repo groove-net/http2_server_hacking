@@ -1,0 +1,294 @@
+HTTP/2 PROJECT — COMPLETE TEST INVENTORY (planned; not yet an implemented suite)
+
+This is the full test surface for the project, not a log of tests run so far.
+Items marked FUTURE cover planned APIs/features.
+
+0. BUILD, API, AND TOOLING
+- clean build with warnings as errors
+- ASan/UBSan/LSan build
+- release build with optimization
+- every public header compiles standalone as C11
+- examples and client/server examples compile against public headers
+- API symbol/link consistency
+- documentation examples compile
+- fuzz targets build (HTTP/2 frames, HPACK-adjacent headers, compression, TLS records)
+- formatting/static-analysis checks
+- dependency/version checks (nghttp2, OpenSSL, zlib, zstd, brotli, liburing)
+
+1. ASYNC ENGINE
+- task_create/task_free ownership and fd close rules
+- io_loop_add_task failure releases task correctly
+- task_start_read/task_stop_read idempotence
+- read ring wrap, contiguous spans, consume edge cases
+- EOF, read_closed, restart after EOF
+- dynamic read pause/resume with buffered input
+- task_write success, partial write, EAGAIN, write_done
+- TASK_WAIT_WRITE with and without active write
+- task_wait_write arming/disarming
+- task_ready from handler/self/external thread rules
+- timer ordering, equal deadlines, cancel, fire/cancel race
+- timer while read/write active
+- task_cancel during callback, deferred reap
+- io_loop_shutdown with active tasks/timers/in-flight IO
+- epoll and io_uring behavioral parity
+- io_uring deferred cancellation and SQ exhaustion paths
+- no busy spin when idle
+- ASan/LSan clean under churn
+
+2. SERVER LIFECYCLE
+- accept task setup/failure
+- listener creation failure exits nonzero
+- multiple listener bind/SO_REUSEPORT behavior
+- worker startup success barrier
+- worker startup failure aborts startup
+- pthread_create failure closes unstarted listeners
+- invalid window config startup failure
+- invalid TLS config startup failure
+- max connection admission/release
+- idle timeout
+- keepalive PING success/timeout
+- drain notice, final GOAWAY, drain deadline
+- SIGTERM/SIGINT clean shutdown
+- connection accounting after failed setup
+- shutdown with active TLS/plain connections
+
+3. HTTP/2 SERVER CORE
+- session creation, window clamping, zero-window rejection
+- direct-fd and transport constructors
+- SETTINGS emission
+- connection/stream receive-window setup
+- HEADERS sequencing and pseudo-header validation
+- header count cap
+- header list-size cap
+- route lookup exact/unknown/empty registry
+- cached :path routing
+- unary dispatch exactly once
+- streaming batch dispatch
+- attached/detached batch ownership
+- prefix/params extraction
+- residual at message boundaries
+- fixed residual capacity and overflow
+- straddling residual/chunk message compaction
+- max_message_size enforcement
+- END_STREAM mid-message rejection
+- DATA before HEADERS rejection
+- DATA on unknown/closed stream
+- RST_STREAM handling
+- GOAWAY handling
+- PING/PING ACK
+- SETTINGS ACK/unknown settings
+- invalid frame/HPACK behavior
+- stream close cleanup
+- state_init/state_free ordering
+- stream accessors: id/ctx/headers
+- header_get binary names/values, duplicates, absent
+- prefix accessor lifetime
+
+4. HTTP/2 RESPONSES
+- respond_begin status/header validation
+- respond_msg copy/open/end behavior
+- respond_msg_owned ownership and failure free
+- respond_end empty reply
+- trailers ordering and deep copy
+- response after EOF rejected
+- response on unknown/reset stream
+- multiple streaming messages
+- zero-length DATA/END_STREAM
+- queue cap stream/connection/tenant/global
+- queue release on full send
+- queue release on reset/close/session free
+- structural control frames not counted as payload
+- tenant IP accounting across connections
+- exact/detached response behavior
+- flush/would-block retry
+
+5. FLOW CONTROL ENGINE (PUBLIC)
+- profile defaults
+- validation errors: zero/order/max/min_update/threshold/low-water/timer/BDP/exact
+- validation warnings
+- fixed target, receipt source, consumption source
+- immediate/threshold/low-water/timer triggers
+- exact vs top-up credit
+- target increase/decrease and target_raise
+- eligible accounting
+- connection target derivation
+- overflow and limit behavior
+- BDP controller (FUTURE)
+- timer tick integration
+- server stream/connection adapter
+- client response adapter
+- fairness/aggregate budgets
+- flow control vs buffer caps interaction
+
+6. HTTP/2 LIMITS AND MEMORY
+- max headers per stream
+- header list size
+- unary max body
+- unary per-session/global budget
+- streaming fixed residual
+- decompressed-size cap
+- response queue hierarchy
+- detached batch lifetime/memory
+- route state/params app-defined growth
+- outbound queue cap under slow peer
+- aggregate residual budget (FUTURE)
+- tenant quota fairness
+- global cap under many connections
+
+7. COMPRESSION LIBRARY
+- gzip/zstd/brotli round-trip
+- fast/balanced/best profiles
+- empty input/output
+- one-byte and boundary sizes
+- chunked input
+- chunked output
+- truncation and corruption
+- decompression bomb/output cap
+- concatenated/trailing input behavior
+- incompressible data
+- large payloads
+- independent concurrent contexts
+- repeated encoder/decoder lifecycle
+- ASan/LSan clean
+
+8. HTTP/2 SERVER COMPRESSION
+- gzip/zstd/brotli unary
+- gzip/zstd/brotli streaming
+- request decompression before prefix/framing
+- response compression across multiple messages
+- empty compressed request/response
+- decompressed max enforcement
+- max message after decompression
+- compression contract mismatch
+- compression + TLS
+- compression + flow control
+- route compression profile mapping
+- no Content-Encoding/Accept-Encoding headers
+- client/server route contract versioning (FUTURE)
+
+9. TLS SERVER (tls_server)
+- cert/key load success/failure
+- key/cert mismatch
+- TLS 1.2 and 1.3
+- ALPN default h2
+- configurable ALPN
+- missing/incorrect ALPN
+- SNI certificate selection (FUTURE)
+- multiple certs (FUTURE)
+- cert reload/rotation (FUTURE)
+- client certificate/mTLS (FUTURE)
+- close_notify
+- partial reads/writes and EAGAIN
+- handshake timeout (FUTURE)
+- TLS record bounds
+- TLS + HTTP/2 large payload
+- TLS + compression
+- TLS + server shutdown
+
+10. TLS CLIENT (tls_client)
+- CA verification success
+- hostname verification success/failure
+- self-signed verification failure
+- insecure mode test-only behavior
+- SNI emission
+- ALPN default/custom/mismatch
+- TLS 1.2 and 1.3
+- nonblocking handshake WANT_READ/WANT_WRITE
+- partial encrypted writes and flush
+- close_notify/EOF
+- client certificate/mTLS (FUTURE)
+- session resumption/cache (FUTURE)
+- cert rotation behavior (FUTURE)
+- TLS + compression
+
+11. HTTP/2 CLIENT CORE
+- unary request/response
+- zero-length request/response
+- multiple concurrent requests on one session
+- multiplexing with one slow stream
+- streaming request producer
+- streaming request multiple messages
+- producer deferred + resume
+- producer EOF with compressor pending
+- streaming response multiple messages
+- incremental compressed response
+- fragmented compressed input
+- identity streaming response
+- response framing residual validation
+- last-message flag semantics
+- headers/status delivery before messages
+- start callback abort behavior
+- request hold/consume partial/all
+- hold across stream close/session free
+- response body/decompressed/message limits
+- request cancellation in flight
+- request_free after completion
+- request_free from callback
+- late callbacks after cancellation
+- RST_STREAM
+- GOAWAY with active requests
+- connection close mid-stream
+- malformed/oversized response
+- unknown/unsupported compression
+- request body compression
+- response body compression
+- queue/output caps
+- nonblocking send window exhaustion
+- ASan/LSan clean
+
+12. HTTP/2 CLIENT TASK
+- nonblocking connect success
+- connect refused
+- connect timeout (FUTURE)
+- SO_ERROR failure
+- TLS handshake over task
+- plaintext over task
+- READ/WRITE state transitions
+- wait-write with no active write
+- task close/cancel/shutdown with active requests
+- task wake on producer resume
+- connection reuse for multiple requests
+- idle connection behavior (FUTURE)
+- GOAWAY replacement (FUTURE)
+- epoll/io_uring
+- ASan/LSan clean
+
+13. CONNECTION POOLING (FUTURE)
+- key by scheme/host/port/SNI/ALPN/tenant
+- one connection per origin reuse
+- max concurrent streams
+- least-active-stream selection
+- open more connections on capacity
+- waiter queue and deadline
+- per-origin/per-tenant caps
+- GOAWAY draining/replacement
+- idle close, keepalive, reconnect
+- stream-ID headroom replacement
+- scale up only on stream capacity/queue, not generic TCP jitter
+- scale down hysteresis
+- failure isolation/retry routing
+
+14. SECURITY AND ROBUSTNESS
+- header/body flooding
+- slowloris and handshake floods
+- decompression bombs
+- response queue exhaustion
+- tenant quota evasion
+- malformed HTTP/2/HPACK
+- TLS verification bypass attempts
+- ALPN downgrade attempts
+- integer overflow in sizes/limits
+- use-after-free on cancellation/close
+- double-free on partial ownership failures
+- fuzz no crashes/leaks
+
+15. PERFORMANCE AND SOAK
+- plaintext vs TLS throughput
+- compression profiles CPU/ratio
+- queue pressure and backpressure
+- many streams/connections
+- large request/response
+- high-latency/high-BDP behavior
+- memory stability under churn
+- timer/CPU idle behavior
+- long-running soak with reconnect/GOAWAY

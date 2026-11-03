@@ -1,7 +1,6 @@
-#include "../../include/http2.h"
-#include "../../include/liblog.h"
+#include "http2_server.h"
 #include "flow_control.h"
-#include "flow_control.c"
+#include "liblog.h"
 #include <errno.h>
 #include <nghttp2/nghttp2.h>
 #include <pthread.h>
@@ -13,7 +12,7 @@
 #include <unistd.h>
 
 /* All internal node structs fit this; larger/variable buffers use malloc. */
-#define H2_NODE_SZ 208
+#define H2_NODE_SZ 224
 #define H2_POOL_MAX 256
 /* Small-object pools are bucketed into 16-byte size classes, so the pool also
  * serves the per-route stream state (whose size is arbitrary). Sizes above the
@@ -26,6 +25,8 @@ typedef struct h2_out {
   size_t len;
   size_t off;
   int eof;
+  int charged;
+  int owned;
   struct h2_out *next;
 } h2_out_t;
 
@@ -39,23 +40,8 @@ struct http2_stream {
   http2_header_t *headers;
   http2_header_t *headers_tail;
   size_t header_count;
-  http2_msg_framing_cb msg_framing;
-  const void *framing_cfg;
-  http2_mode_t mode;
-  int detach;
-  union {
-    http2_unary_fn unary;
-    http2_stream_fn stream;
-  } handler;
+  http2_raw_fn raw;
   const http2_route_t *route;
-  size_t prefix_len;
-  size_t prefix_got;
-  uint8_t *params;
-  uint8_t *body;
-  size_t body_len;
-  size_t body_cap;
-  size_t body_head; /* streaming residual ring start; always 0 for unary */
-  size_t unary_charged;
   h2_out_t *out_head;
   h2_out_t *out_tail;
   int resp_opened;
@@ -66,6 +52,7 @@ struct http2_stream {
   uint32_t trailer_nvlen;
   int trailers;
   h2_flow_t *flow;
+  size_t queued_bytes;
 };
 
 _Static_assert(sizeof(http2_stream_t) <= H2_NODE_SZ, "stream fits pool");
@@ -78,12 +65,6 @@ _Static_assert(H2_NODE_SZ <= H2_CLASS_MAX * H2_CLASS_UNIT, "node size pooled");
 static _Thread_local void *h2_pool[H2_CLASS_MAX];
 static _Thread_local int h2_pool_n[H2_CLASS_MAX];
 
-/* Process-wide unary-body budget, shared by all worker threads. The per-session
- * budgets are plain fields because a session is owner-thread-only. */
-static _Atomic size_t g_unary_bytes = 0;
-static _Atomic size_t g_unary_budget = 0; /* 0 = unlimited */
-
-/* 1-based class index for a byte size, or 0 if too large to pool. */
 static int h2_class(size_t sz) {
   size_t c = (sz + (H2_CLASS_UNIT - 1)) / H2_CLASS_UNIT;
   return (c >= 1 && c <= H2_CLASS_MAX) ? (int)c : 0;
@@ -164,8 +145,6 @@ struct http2_session {
   uint32_t slot_cap;      /* slot array length; 0 until the first stream */
   uint32_t slot_used;     /* live entries */
   uint32_t stream_window; /* per-stream local receive window target */
-  size_t unary_budget;    /* per-session cap; 0 = unlimited */
-  size_t unary_bytes;     /* charged unary body bytes */
   uint64_t app_activity;  /* monotonic inbound request HEADERS/DATA count */
   int ping_ack_seen;
   uint64_t ping_ack_opaque;
@@ -179,6 +158,9 @@ struct http2_session {
   flow_window_t conn_flow;
   uint32_t connection_window;
   int flow_enabled;
+  size_t queued_bytes;
+  size_t stream_queue_limit;
+  size_t connection_queue_limit;
 };
 
 /* Sessions are worker-pinned; nghttp2 itself is not thread-safe. Enforce the
@@ -193,213 +175,45 @@ static void h2_require_owner(const http2_session_t *s) {
   }
 }
 
-/* Charge unary body bytes against the session and process budgets. The
- * process budget uses CAS so concurrent workers cannot overshoot it. Returns
- * 0 on success, -1 if either budget would be exceeded. */
-static int h2_charge_unary(http2_session_t *s, http2_stream_t *st, size_t n) {
-  if (n == 0) {
+static size_t h2_queue_limit(size_t value, size_t fallback) {
+  return value != 0 ? value : fallback;
+}
+
+static int h2_queue_fits(const http2_session_t *s, const http2_stream_t *st,
+                         size_t n) {
+  if (n > s->stream_queue_limit ||
+      st->queued_bytes > s->stream_queue_limit - n) {
     return 0;
   }
-  if (s->unary_budget != 0 &&
-      (s->unary_bytes > s->unary_budget ||
-       n > s->unary_budget - s->unary_bytes)) {
-    return -1;
+  if (n > s->connection_queue_limit ||
+      s->queued_bytes > s->connection_queue_limit - n) {
+    return 0;
   }
-  size_t limit = atomic_load_explicit(&g_unary_budget, memory_order_relaxed);
-  if (limit != 0) {
-    size_t cur = atomic_load_explicit(&g_unary_bytes, memory_order_relaxed);
-    for (;;) {
-      if (cur > limit || n > limit - cur) {
-        return -1;
-      }
-      if (atomic_compare_exchange_weak_explicit(
-              &g_unary_bytes, &cur, cur + n, memory_order_relaxed,
-              memory_order_relaxed)) {
-        break;
-      }
-    }
-  } else {
-    atomic_fetch_add_explicit(&g_unary_bytes, n, memory_order_relaxed);
-  }
-  s->unary_bytes += n;
-  st->unary_charged += n;
-  return 0;
-}
-
-/* Release `n` bytes charged for this stream (used when a buffer allocation
- * fails after the charge succeeded). */
-static void h2_uncharge_unary_n(http2_session_t *s, http2_stream_t *st,
-                                size_t n) {
-  if (n == 0) {
-    return;
-  }
-  st->unary_charged = n <= st->unary_charged ? st->unary_charged - n : 0;
-  s->unary_bytes = n <= s->unary_bytes ? s->unary_bytes - n : 0;
-  atomic_fetch_sub_explicit(&g_unary_bytes, n, memory_order_relaxed);
-}
-
-/* Release everything a stream charged. Idempotent via unary_charged. */
-static void h2_uncharge_unary(http2_session_t *s, http2_stream_t *st) {
-  h2_uncharge_unary_n(s, st, st->unary_charged);
+  return 1;
 }
 
 /* Internal forward declarations (these are no longer part of the public API). */
-static void http2_stream_set_unary(http2_stream_t *st,
-                                   http2_msg_framing_cb msg_framing,
-                                   const void *cfg, http2_unary_fn fn);
-static void http2_stream_set_stream(http2_stream_t *st, size_t prefix_len,
-                                    http2_msg_framing_cb msg_framing,
-                                    const void *cfg, http2_stream_fn fn);
-static void http2_stream_set_detach(http2_stream_t *st, int detach);
 static http2_stream_t *http2_find_stream(http2_session_t *s, int32_t id);
 static int http2_respond_headers(http2_session_t *s, int32_t sid,
                                  const nghttp2_nv *nva, size_t nvlen);
 static int http2_send(http2_session_t *s, int32_t sid, uint8_t *payload,
                       size_t len, int end_stream);
+static int http2_send_ex(http2_session_t *s, int32_t sid, uint8_t *payload,
+                         size_t len, int end_stream, int owned);
 static int h2_flow_profile_internal(http2_flow_profile_t profile);
+static http2_route_resolver_fn g_route_resolver;
+static void *g_route_ctx;
 
-/* ----------------------------------------------------------------------------
- * Batch object (see http2_batch_t). Attached: a stack struct over borrowed
- * message pointers, owned == 0, released (no-op) after the handler call.
- * Detached: one allocation holding [struct | http2_msg_t[] | message bytes],
- * owned == 1, released by the handler -- sync or later.
- * ------------------------------------------------------------------------- */
-struct http2_batch {
-  http2_msg_t *msgs;
-  size_t n;
-  int owned;
-  int32_t sid;     /* stream id, for returning flow-control credit */
-  size_t consume;  /* wire bytes awaiting credit; 0 if already credited */
-};
-
-const http2_msg_t *http2_batch_msgs(const http2_batch_t *b, size_t *n) {
-  if (n != NULL) {
-    *n = b != NULL ? b->n : 0;
-  }
-  return b != NULL ? b->msgs : NULL;
-}
-
-int http2_batch_owned(const http2_batch_t *b) { return b != NULL ? b->owned : 0; }
-
-void http2_batch_release(http2_batch_t *b) {
-  if (b != NULL && b->owned) {
-    free(b); /* single allocation: struct + msgs + bytes */
-  }
-}
-
-/* ----------------------------------------------------------------------------
- * Optional route registry (see http2_route_add). Register before serving; if
- * any route exists the module resolves each request's :path and binds the
- * stream's framing+handler itself. An empty registry leaves wiring to the
- * frame observer (backward compatible).
- * ------------------------------------------------------------------------- */
-#define H2_ROUTE_MAX 64
-#define H2_ROUTE_SLOTS 256 /* power of two, > 2 * H2_ROUTE_MAX */
-
-static http2_route_t g_route_tab[H2_ROUTE_MAX];
-static size_t g_route_path_len[H2_ROUTE_MAX];
-static uint64_t g_route_key[H2_ROUTE_MAX]; /* valid when path_len <= 8 */
-static size_t g_route_len;
-static int g_route_slots[H2_ROUTE_SLOTS]; /* index+1 into g_route_tab, 0 = empty */
-
-static uint32_t route_hash(const uint8_t *p, size_t n) {
-  uint32_t h = 2166136261u;
-  for (size_t i = 0; i < n; i++) {
-    h ^= p[i];
-    h *= 16777619u;
-  }
-  return h;
-}
-
-/* Pack up to eight non-NUL path bytes, padding with trailing zeroes. The
- * mapping is injective for NUL-free paths of length <= 8. */
-static uint64_t route_pack(const uint8_t *p, size_t n) {
-  uint64_t k = 0;
-  for (size_t i = 0; i < n; i++) {
-    k |= (uint64_t)p[i] << (8 * (7 - i));
-  }
-  return k;
-}
-
-/* SplitMix64: a fast integer key hash with no byte loop. */
-static uint64_t route_mix(uint64_t x) {
-  x += 0x9e3779b97f4a7c15ull;
-  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
-  x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
-  return x ^ (x >> 31);
-}
-
-int http2_route_add(const http2_route_t *r) {
-  if (r == NULL || r->path == NULL || g_route_len >= H2_ROUTE_MAX) {
-    return -1;
-  }
-  if (r->flow_profile != HTTP2_FLOW_INHERIT &&
-      h2_flow_profile_internal(r->flow_profile) < 0) {
-    return -1;
-  }
-  size_t klen = strlen(r->path);
-  g_route_tab[g_route_len] = *r;
-  g_route_path_len[g_route_len] = klen;
-  g_route_key[g_route_len] = klen <= 8 ? route_pack((const uint8_t *)r->path,
-                                                    klen)
-                                      : 0;
-  size_t mask = H2_ROUTE_SLOTS - 1;
-  size_t i = (klen <= 8 ? (size_t)route_mix(g_route_key[g_route_len])
-                        : (size_t)route_hash((const uint8_t *)r->path, klen)) &
-             mask;
-  while (g_route_slots[i] != 0) {
-    i = (i + 1) & mask;
-  }
-  g_route_slots[i] = (int)g_route_len + 1;
-  g_route_len++;
-  return 0;
+void http2_set_route_resolver(http2_route_resolver_fn fn, void *ctx) {
+  g_route_resolver = fn;
+  g_route_ctx = ctx;
 }
 
 static const http2_route_t *route_lookup(const uint8_t *path, size_t plen) {
-  if (g_route_len == 0) {
-    return NULL;
-  }
-  size_t mask = H2_ROUTE_SLOTS - 1;
-  uint64_t key = 0;
-  int short_key = plen <= 8;
-  for (size_t i = 0; short_key && i < plen; i++) {
-    if (path[i] == 0) {
-      short_key = 0; /* NUL is not representable by the packed key */
-      break;
-    }
-  }
-  if (short_key) {
-    key = route_pack(path, plen);
-    size_t i = (size_t)route_mix(key) & mask;
-    for (;;) {
-      int slot = g_route_slots[i];
-      if (slot == 0) {
-        return NULL;
-      }
-      size_t idx = (size_t)slot - 1;
-      if (g_route_path_len[idx] == plen && g_route_key[idx] == key) {
-        return &g_route_tab[idx];
-      }
-      i = (i + 1) & mask;
-    }
-  }
-  /* Long paths, or paths containing NUL, use the byte-keyed fallback. */
-  size_t i = route_hash(path, plen) & mask;
-  for (;;) {
-    int slot = g_route_slots[i];
-    if (slot == 0) {
-      return NULL;
-    }
-    size_t idx = (size_t)slot - 1;
-    if (g_route_path_len[idx] == plen &&
-        memcmp(g_route_tab[idx].path, path, plen) == 0) {
-      return &g_route_tab[idx];
-    }
-    i = (i + 1) & mask;
-  }
+  return g_route_resolver != NULL ? g_route_resolver(g_route_ctx, path, plen)
+                                  : NULL;
 }
 
-/* Bind a resolved route to the stream; RST unknown routes. */
 static void wire_request_route(http2_session_t *s, http2_stream_t *st,
                                const http2_route_t *r) {
   if (r == NULL) {
@@ -407,21 +221,12 @@ static void wire_request_route(http2_session_t *s, http2_stream_t *st,
     http2_rst_stream(s, st->id);
     return;
   }
-  if (r->mode == HTTP2_STREAMING) {
-    /* Without a framing rule there are no message boundaries; the handler
-     * cannot be called meaningfully, so reject the request. */
-    if (r->msg_framing == NULL) {
-      log_error("[h2] stream %d: streaming route has no framing", (int)st->id);
-      http2_rst_stream(s, st->id);
-      return;
-    }
-    http2_stream_set_stream(st, r->params_len, r->msg_framing, r->framing_cfg,
-                            r->handler.stream);
-    http2_stream_set_detach(st, r->detach);
-  } else {
-    http2_stream_set_unary(st, r->msg_framing, r->framing_cfg,
-                           r->handler.unary);
+  if (r->raw == NULL) {
+    log_error("[h2] stream %d: route has no raw handler", (int)st->id);
+    http2_rst_stream(s, st->id);
+    return;
   }
+  st->raw = r->raw;
   st->route = r;
   /* Per-route stream state: allocate zeroed ctx of the route's size and run its
    * constructor, so handlers can cast st->ctx to their route-specific struct. */
@@ -448,20 +253,26 @@ static void free_headers(http2_header_t *h) {
   }
 }
 
-static void free_out_list(h2_out_t *m) {
-  while (m != NULL) {
-    h2_out_t *next = m->next;
-    free(m->payload);
-    h2_node_free(m);
-    m = next;
+static void out_release(http2_session_t *s, http2_stream_t *st, h2_out_t *m) {
+  if (m->charged) {
+    if (st != NULL && st->queued_bytes >= m->len) {
+      st->queued_bytes -= m->len;
+    }
+    if (s != NULL && s->queued_bytes >= m->len) {
+      s->queued_bytes -= m->len;
+    }
+    m->charged = 0;
   }
+  if (m->owned) free(m->payload);
+  h2_node_free(m);
 }
 
-/* Release one queued node (payload + node). Used when a node is popped
- * after its frame fully sends, or dropped on stream reset/close. */
-static void out_release(h2_out_t *m) {
-  free(m->payload);
-  h2_node_free(m);
+static void free_out_list(http2_session_t *s, http2_stream_t *st, h2_out_t *m) {
+  while (m != NULL) {
+    h2_out_t *next = m->next;
+    out_release(s, st, m);
+    m = next;
+  }
 }
 
 /* --- response trailers ---------------------------------------------------- */
@@ -629,7 +440,6 @@ static void slot_erase(http2_session_t *s, int32_t id) {
 
 /* Discard one stream node and everything it owns (incl. its app ctx state). */
 static void stream_free_node(http2_session_t *s, http2_stream_t *dead) {
-  h2_uncharge_unary(s, dead);
   /* The parked in-flight frame (if any) is still linked in dead->out_head, so
    * clear the parking slot first; free_out_list() then releases it exactly
    * once. Clearing without freeing avoids a double-free. */
@@ -638,10 +448,8 @@ static void stream_free_node(http2_session_t *s, http2_stream_t *dead) {
     s->parked.msg = NULL;
   }
   free_headers(dead->headers);
-  free(dead->params);
-  free(dead->body);
   h2_trailers_free(dead);
-  free_out_list(dead->out_head);
+  free_out_list(s, dead, dead->out_head);
   if (dead->ctx != NULL && dead->route != NULL) {
     /* Run the route's destructor. Only module-allocated state (state_size > 0)
      * is returned to the pool; state_size == 0 means app-managed ctx. */
@@ -676,7 +484,7 @@ static http2_stream_t *find_or_create_stream(http2_session_t *s, int32_t id) {
   if (st == NULL) {
     return NULL;
   }
-  st->id = id; /* zeroed: no framing/handler configured until on_frame */
+  st->id = id; /* zeroed until the route resolves at request HEADERS */
   if (slot_insert(s, st) != 0) {
     h2_node_free(st);
     return NULL;
@@ -886,7 +694,7 @@ static int on_send_data(nghttp2_session *session, nghttp2_frame *frame,
         if (was_eof) {
           st->resp_closed = 1;
         }
-        out_release(m);
+        out_release(s, st, m);
       }
       p->active = 0;
       p->msg = NULL;
@@ -904,7 +712,7 @@ static int on_send_data(nghttp2_session *session, nghttp2_frame *frame,
     if (was_eof) {
       st->resp_closed = 1;
     }
-    out_release(m);
+    out_release(s, st, m);
   }
   p->active = 0;
   p->msg = NULL;
@@ -959,7 +767,7 @@ static int on_header(nghttp2_session *session, const nghttp2_frame *frame,
   /* Resolve routing while the header block is already being walked, so
    * on_frame_recv does not need to rescan the list for :path. */
   if (frame->headers.cat == NGHTTP2_HCAT_REQUEST && st->route == NULL &&
-      g_route_len > 0 && namelen == 5 && memcmp(name, ":path", 5) == 0) {
+      g_route_resolver != NULL && namelen == 5 && memcmp(name, ":path", 5) == 0) {
     st->route = route_lookup(value, valuelen);
   }
   return 0;
@@ -973,27 +781,6 @@ void http2_rst_stream(http2_session_t *s, int32_t sid) {
   nghttp2_submit_rst_stream(s->session, 0, sid, NGHTTP2_PROTOCOL_ERROR);
 }
 
-/* Ensure st->body holds at least `want` bytes. Returns 0, or -1 on OOM. */
-static int stream_reserve(http2_stream_t *st, size_t want) {
-  if (want <= st->body_cap) {
-    return 0;
-  }
-  size_t cap = st->body_cap != 0 ? st->body_cap : 256;
-  while (cap < want) {
-    if (cap > SIZE_MAX / 2) {
-      cap = want;
-      break;
-    }
-    cap *= 2;
-  }
-  uint8_t *grown = realloc(st->body, cap);
-  if (grown == NULL) {
-    return -1;
-  }
-  st->body = grown;
-  st->body_cap = cap;
-  return 0;
-}
 
 static uint64_t h2_now_ms(void) {
   struct timespec ts;
@@ -1088,14 +875,11 @@ static int h2_apply_connection_credit(http2_session_t *s, flow_credit_t credit) 
   return 0;
 }
 
-/* Hand one framed batch to the stream's handler. Attached: a stack batch over
- * the borrowed pointers, valid for the call only. Detached: copy the whole batch
- * into one owned block, hand that over, and let the handler release it. */
 /* Return `n` received DATA bytes to the flow-control window. The bytes were
  * counted against both the stream and the connection window, so credit the
  * connection even when the stream is already gone -- otherwise a reset stream
  * would leak connection credit and eventually stall every other stream. */
-static int h2_consume_stream(http2_session_t *s, int32_t sid, size_t n) {
+static int h2_consume_stream_now(http2_session_t *s, int32_t sid, size_t n) {
   if (n == 0) {
     return 0;
   }
@@ -1127,166 +911,10 @@ static int h2_consume_stream(http2_session_t *s, int32_t sid, size_t n) {
   return rc != 0 ? -1 : 0;
 }
 
-static void reverse_bytes(uint8_t *p, size_t n) {
-  for (size_t i = 0, j = n; i + 1 < j; i++, j--) {
-    uint8_t t = p[i];
-    p[i] = p[j - 1];
-    p[j - 1] = t;
-  }
+static int h2_consume_stream(http2_session_t *s, int32_t sid, size_t n) {
+  return h2_consume_stream_now(s, sid, n);
 }
 
-/* The residual ring is contiguous for the framing view. If it wrapped, rotate
- * the whole buffer left by head so the live bytes start at offset 0. This runs
- * at most once per buffer-full of consumed data, not once per chunk. */
-static void ring_linearize(http2_stream_t *st) {
-  if (st->body_len == 0) {
-    st->body_head = 0;
-    return;
-  }
-  if (st->body_head <= st->body_cap - st->body_len) {
-    return;
-  }
-  size_t h = st->body_head;
-  reverse_bytes(st->body, h);
-  reverse_bytes(st->body + h, st->body_cap - h);
-  reverse_bytes(st->body, st->body_cap);
-  st->body_head = 0;
-}
-
-/* Move the live region to offset 0 when its old head space is needed. */
-static void ring_compact(http2_stream_t *st) {
-  if (st->body_head == 0) {
-    return;
-  }
-  ring_linearize(st);
-  if (st->body_head != 0) {
-    memmove(st->body, st->body + st->body_head, st->body_len);
-    st->body_head = 0;
-  }
-}
-
-/* Append bytes to the residual ring, growing or compacting only when the live
- * length no longer fits. Returns 0, or -1 on OOM. */
-static int ring_append(http2_stream_t *st, const uint8_t *src, size_t n) {
-  if (n == 0) {
-    return 0;
-  }
-  size_t need = st->body_len + n;
-  if (need > st->body_cap) {
-    ring_compact(st);
-    if (need > st->body_cap) {
-      size_t cap = st->body_cap != 0 ? st->body_cap : 256;
-      while (cap < need) {
-        if (cap > SIZE_MAX / 2) {
-          cap = need;
-          break;
-        }
-        cap *= 2;
-      }
-      uint8_t *grown = realloc(st->body, cap);
-      if (grown == NULL) {
-        return -1;
-      }
-      st->body = grown;
-      st->body_cap = cap;
-    }
-  }
-  size_t tail = (st->body_head + st->body_len) % st->body_cap;
-  size_t first = st->body_cap - tail;
-  if (first > n) {
-    first = n;
-  }
-  memcpy(st->body + tail, src, first);
-  if (first < n) {
-    memcpy(st->body, src + first, n - first);
-  }
-  st->body_len += n;
-  return 0;
-}
-
-/* Keep the incomplete tail: old residual bytes after `cur` stay in place and
- * only the new-chunk tail is appended. */
-static int ring_store_tail(http2_stream_t *st, const http2_view_t *v,
-                           size_t cur, size_t left) {
-  size_t old_rem = cur < v->an ? v->an - cur : 0;
-  size_t new_len = left - old_rem;
-  const uint8_t *new_tail = NULL;
-  if (new_len > 0) {
-    size_t off = cur > v->an ? cur - v->an : 0;
-    new_tail = v->b + off;
-  }
-  if (old_rem > 0) {
-    st->body_head += cur;
-  } else {
-    st->body_head = 0;
-  }
-  st->body_len = old_rem;
-  if (st->body_len == 0) {
-    st->body_head = 0;
-  }
-  return ring_append(st, new_tail, new_len);
-}
-
-/* Hand a batch to the handler. `consume` is the wire-byte count that must be
- * credited when the consumer is done: attached batches are credited here
- * (the handler is synchronous), detached ones defer until the app calls
- * http2_batch_consume(). Returns the number of bytes left uncredited (i.e. the
- * deferred amount), so the caller can account for them on error paths. */
-static size_t flush_batch(http2_session_t *s, http2_stream_t *st,
-                          http2_msg_t *tmp, size_t bn, size_t consume) {
-  if (bn == 0) {
-    h2_consume_stream(s, st->id, consume);
-    return 0;
-  }
-  http2_stream_fn sink = st->handler.stream;
-  if (!st->detach) {
-    if (sink != NULL) {
-      /* Attached: credit is the module's job, not the app's. */
-      http2_batch_t b = {tmp, bn, 0, st->id, 0};
-      sink(s, st, &b);
-    }
-    h2_consume_stream(s, st->id, consume);
-    return 0;
-  }
-
-  size_t total = 0;
-  for (size_t i = 0; i < bn; i++) {
-    total += tmp[i].len;
-  }
-  size_t hdr = sizeof(http2_batch_t) + bn * sizeof(http2_msg_t);
-  uint8_t *base = malloc(hdr + total);
-  if (base == NULL) {
-    h2_consume_stream(s, st->id, consume);
-    http2_rst_stream(s, st->id);
-    return 0;
-  }
-  http2_batch_t *b = (http2_batch_t *)base;
-  b->msgs = (http2_msg_t *)(base + sizeof(http2_batch_t));
-  b->n = bn;
-  b->owned = 1;
-  b->sid = st->id;
-  b->consume = consume;
-  uint8_t *dst = base + hdr;
-  for (size_t i = 0; i < bn; i++) {
-    b->msgs[i].msg = dst;
-    b->msgs[i].len = tmp[i].len;
-    memcpy(dst, tmp[i].msg, tmp[i].len);
-    dst += tmp[i].len;
-  }
-  if (sink != NULL) {
-    sink(s, st, b); /* ownership passes to the handler */
-    return consume; /* app credits it via http2_batch_consume() */
-  }
-  h2_consume_stream(s, st->id, consume);
-  http2_batch_release(b); /* no handler: do not leak */
-  return 0;
-}
-
-/* DATA payloads. Unary streams accumulate the whole body; streaming streams
- * consume the one-time prefix into st->params, then frame complete elements out
- * of the residual + this chunk and hand them to the handler in batches (up to
- * HTTP2_BATCH_MAX). A message wholly inside one segment is a borrowed pointer
- * (zero copies); only a straddling one is compacted, once. */
 static int on_data_chunk(nghttp2_session *session, uint8_t flags,
                          int32_t stream_id, const uint8_t *data, size_t len,
                          void *user_data) {
@@ -1294,146 +922,18 @@ static int on_data_chunk(nghttp2_session *session, uint8_t flags,
   (void)flags;
   http2_session_t *s = user_data;
   s->app_activity++;
-  /* DATA is valid only for a stream created by its request HEADERS. Never
-   * create a stream from a DATA frame. */
   http2_stream_t *st = slot_find(s, stream_id);
   if (st == NULL) {
     log_error("[h2] DATA for unknown stream %d", (int)stream_id);
     return NGHTTP2_ERR_CALLBACK_FAILURE;
   }
   h2_flow_received(s, st, len);
-
-  if (st->mode != HTTP2_STREAMING) {
-    if (st->body_len + len > HTTP2_MAX_BODY) {
-      log_error("[h2] stream %d: body exceeds %u bytes", (int)st->id,
-                (unsigned)HTTP2_MAX_BODY);
-      return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-    if (h2_charge_unary(s, st, len) != 0) {
-      log_error("[h2] stream %d: unary body budget exceeded", (int)st->id);
-      return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-    if (stream_reserve(st, st->body_len + len) != 0) {
-      h2_uncharge_unary_n(s, st, len);
-      return NGHTTP2_ERR_CALLBACK_FAILURE;
-    }
-    memcpy(st->body + st->body_len, data, len);
-    st->body_len += len;
-    /* Unary buffers the whole body (capped above), so credit on receipt. */
-    h2_consume_stream(s, st->id, len);
+  if (st->raw == NULL) {
+    h2_consume_stream_now(s, st->id, len);
     return 0;
   }
-
-  /* Every byte of this chunk must be credited exactly once: now (module
-   * buffers it, or the handler is synchronous) or later (detached batch). */
-  size_t orig_len = len;
-  size_t credited = 0;
-  size_t deferred = 0;
-
-  /* One-time params region: accumulate exactly prefix_len bytes into the
-   * module-owned params buffer; the body buffer stays the element residual. */
-  if (st->prefix_got < st->prefix_len) {
-    if (st->params == NULL) {
-      st->params = malloc(st->prefix_len);
-      if (st->params == NULL) {
-        h2_consume_stream(s, st->id, orig_len);
-        http2_rst_stream(s, st->id);
-        return 0;
-      }
-    }
-    size_t need = st->prefix_len - st->prefix_got;
-    size_t take = need < len ? need : len;
-    memcpy(st->params + st->prefix_got, data, take);
-    st->prefix_got += take;
-    data += take;
-    len -= take;
-    h2_consume_stream(s, st->id, take);
-    credited += take;
-    if (st->prefix_got < st->prefix_len) {
-      return 0; /* prefix still incomplete */
-    }
-  }
-
-  ring_linearize(st);
-  const uint8_t *residual =
-      st->body_len > 0 ? st->body + st->body_head : NULL;
-  http2_msg_t batch[HTTP2_BATCH_MAX];
-  size_t bn = 0;
-  size_t bcons = 0; /* new-chunk bytes represented by the current batch */
-  uint8_t *straddle = NULL; /* a straddler's compacted copy, held until its batch */
-  http2_view_t v = {residual, st->body_len, data, len};
-  size_t total = st->body_len + len;
-  size_t cur = 0;
-  for (;;) {
-    size_t mlen = st->msg_framing(st->framing_cfg, &v, cur, total - cur);
-    if (mlen == 0) {
-      break; /* incomplete: stash the tail below */
-    }
-    /* The residual part of a message was already credited when buffered; only
-     * the new-chunk part still needs credit. */
-    size_t old = 0;
-    if (cur < v.an) {
-      old = mlen < v.an - cur ? mlen : v.an - cur;
-    }
-    bcons += mlen - old;
-    if (cur + mlen <= v.an) {
-      batch[bn].msg = v.a + cur; /* wholly residual */
-    } else if (cur >= v.an) {
-      batch[bn].msg = v.b + (cur - v.an); /* wholly new chunk: zero copies */
-    } else {
-      straddle = malloc(mlen); /* straddles: the single compacting copy */
-      if (straddle == NULL) {
-        h2_consume_stream(s, st->id, orig_len - credited - deferred);
-        http2_rst_stream(s, st->id);
-        return 0;
-      }
-      memcpy(straddle, v.a + cur, v.an - cur);
-      memcpy(straddle + (v.an - cur), v.b, mlen - (v.an - cur));
-      batch[bn].msg = straddle;
-    }
-    batch[bn].len = mlen;
-    bn++;
-    cur += mlen;
-    if (bn == HTTP2_BATCH_MAX) {
-      size_t d = flush_batch(s, st, batch, bn, bcons);
-      deferred += d;
-      credited += bcons - d;
-      bcons = 0;
-      bn = 0;
-      free(straddle);
-      straddle = NULL;
-    }
-  }
-  if (bn > 0) {
-    size_t d = flush_batch(s, st, batch, bn, bcons);
-    deferred += d;
-    credited += bcons - d;
-    bcons = 0;
-  }
-  free(straddle);
-
-  size_t left = total - cur;
-  if (left > HTTP2_MAX_RESIDUAL) {
-    log_error("[h2] stream %d: residual overflow", (int)st->id);
-    h2_consume_stream(s, st->id, orig_len - credited - deferred);
-    http2_rst_stream(s, st->id);
-    return 0;
-  }
-  /* The residual stays module-owned: credit its new-chunk part now (the old
-   * part was credited when it was first buffered). */
-  size_t a_tail = cur < v.an ? v.an - cur : 0;
-  size_t b_tail = left - a_tail;
-  h2_consume_stream(s, st->id, b_tail);
-  credited += b_tail;
-  if (left == 0) {
-    st->body_len = 0;
-    st->body_head = 0; /* keep capacity for reuse */
-    return 0;
-  }
-  if (ring_store_tail(st, &v, cur, left) != 0) {
-    log_error("[h2] stream %d: residual buffer allocation failed", (int)st->id);
-    return NGHTTP2_ERR_CALLBACK_FAILURE;
-  }
+  st->raw(s, st, data, len);
+  h2_consume_stream_now(s, st->id, len);
   return 0;
 }
 
@@ -1492,7 +992,7 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
       log_error("[h2] stream %d: set_local_window_size failed",
                 (int)frame->hd.stream_id);
     }
-    if (g_route_len > 0 && st != NULL) {
+    if (st != NULL && st->route != NULL) {
       wire_request_route(s, st, r);
     }
   }
@@ -1503,32 +1003,9 @@ static int on_frame_recv(nghttp2_session *session, const nghttp2_frame *frame,
     if (st == NULL) {
       return 0;
     }
-    if (st->mode == HTTP2_STREAMING) {
-      /* Streaming: END_STREAM must land on a message boundary with a complete
-       * params region. */
-      if (st->prefix_got < st->prefix_len || st->body_len > 0) {
-        log_error("[h2] stream %d: ended mid-message (prefix %zu/%zu, tail %zu)",
-                  (int)st->id, st->prefix_got, st->prefix_len, st->body_len);
-        http2_rst_stream(s, st->id);
-      }
-    } else if (st->msg_framing != NULL || st->handler.unary != NULL) {
-      /* Unary: with a framing rule the buffered body must be exactly one
-       * complete message; without one, hand the whole body over unvalidated. */
-      int ok = 1;
-      if (st->msg_framing != NULL) {
-        http2_view_t v = {st->body, st->body_len, NULL, 0};
-        size_t m = st->msg_framing(st->framing_cfg, &v, 0, st->body_len);
-        if (m == 0 || m != st->body_len) {
-          log_error("[h2] stream %d: unary body is not one message (%zu bytes)",
-                    (int)st->id, st->body_len);
-          ok = 0;
-        }
-      }
-      if (!ok) {
-        http2_rst_stream(s, st->id);
-      } else if (st->handler.unary != NULL) {
-        st->handler.unary(s, st, st->body, st->body_len);
-      }
+    if (st->raw != NULL && st->route != NULL &&
+        st->route->stream_end != NULL) {
+      st->route->stream_end(s, st);
     }
   }
   return 0;
@@ -1580,6 +1057,8 @@ static http2_session_t *http2_session_new_impl(
     return NULL;
   }
   s->flow_enabled = 1;
+  s->stream_queue_limit = HTTP2_DEFAULT_STREAM_QUEUE;
+  s->connection_queue_limit = HTTP2_DEFAULT_CONNECTION_QUEUE;
   if (transport != NULL) {
     s->write_fn = transport->write;
     s->writev_fn = transport->writev;
@@ -1601,10 +1080,8 @@ static http2_session_t *http2_session_new_impl(
   nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close);
   nghttp2_session_callbacks_set_on_header_callback(cbs, on_header);
 
-  /* Manual flow-control accounting: the module credits bytes as it buffers or
-   * delivers them, and leaves detached batches uncredited until the consumer
-   * reports progress (http2_batch_consume). Until then the peer throttles on
-   * the stream/connection window -- that is the backpressure. */
+  /* Manual flow-control accounting: the module credits bytes as it delivers
+   * them. The application controls credit timing through consume calls. */
   nghttp2_option *opt = NULL;
   if (nghttp2_option_new(&opt) != 0) {
     nghttp2_session_callbacks_del(cbs);
@@ -1690,6 +1167,27 @@ http2_flow_profile_t http2_session_flow_profile(const http2_session_t *s) {
   return s != NULL ? s->flow_profile : HTTP2_FLOW_INHERIT;
 }
 
+int http2_session_set_queue_limits(http2_session_t *s, size_t stream_limit,
+                                   size_t connection_limit) {
+  if (s == NULL) {
+    return -1;
+  }
+  h2_require_owner(s);
+  stream_limit = h2_queue_limit(stream_limit, HTTP2_DEFAULT_STREAM_QUEUE);
+  connection_limit =
+      h2_queue_limit(connection_limit, HTTP2_DEFAULT_CONNECTION_QUEUE);
+  if (connection_limit < stream_limit) {
+    return -1;
+  }
+  s->stream_queue_limit = stream_limit;
+  s->connection_queue_limit = connection_limit;
+  return 0;
+}
+
+size_t http2_session_queued_bytes(const http2_session_t *s) {
+  return s != NULL ? s->queued_bytes : 0;
+}
+
 http2_session_t *http2_session_new_transport(const http2_transport_t *transport,
                                              int client_fd,
                                              uint32_t stream_window_size,
@@ -1742,7 +1240,7 @@ void http2_session_free(http2_session_t *s) {
   if (s->parked.active && s->parked.msg != NULL) {
     /* Session dying with a frame mid-flight (idle connection closed
      * between EAGAIN and resume): release it here. */
-    out_release(s->parked.msg);
+    out_release(s, NULL, s->parked.msg);
   }
   nghttp2_session_del(s->session);
   free(s);
@@ -1803,27 +1301,6 @@ int http2_session_ping_ack(http2_session_t *s, uint64_t *opaque) {
   return 1;
 }
 
-void http2_set_global_unary_budget(size_t bytes) {
-  atomic_store_explicit(&g_unary_budget, bytes, memory_order_relaxed);
-}
-
-int http2_session_set_unary_budget(http2_session_t *s, size_t bytes) {
-  if (s == NULL) {
-    return -1;
-  }
-  h2_require_owner(s);
-  s->unary_budget = bytes;
-  return 0;
-}
-
-size_t http2_session_unary_bytes(const http2_session_t *s) {
-  if (s == NULL) {
-    return 0;
-  }
-  h2_require_owner(s);
-  return s->unary_bytes;
-}
-
 uint64_t http2_session_app_activity(const http2_session_t *s) {
   if (s == NULL) {
     return 0;
@@ -1832,40 +1309,6 @@ uint64_t http2_session_app_activity(const http2_session_t *s) {
   return s->app_activity;
 }
 
-static void http2_stream_set_unary(http2_stream_t *st, http2_msg_framing_cb msg_framing,
-                            const void *cfg, http2_unary_fn fn) {
-  if (st == NULL) {
-    return;
-  }
-  st->mode = HTTP2_UNARY;
-  st->msg_framing = msg_framing;
-  st->framing_cfg = cfg;
-  st->prefix_len = 0;
-  st->prefix_got = 0;
-  st->handler.unary = fn;
-}
-
-static void http2_stream_set_stream(http2_stream_t *st, size_t prefix_len,
-                                    http2_msg_framing_cb msg_framing,
-                                    const void *cfg, http2_stream_fn fn) {
-  if (st == NULL) {
-    return;
-  }
-  /* Streaming needs a framing rule; without one there are no message
-   * boundaries, so fall back to unary buffering. */
-  st->mode = msg_framing != NULL ? HTTP2_STREAMING : HTTP2_UNARY;
-  st->msg_framing = msg_framing;
-  st->framing_cfg = cfg;
-  st->prefix_len = st->mode == HTTP2_STREAMING ? prefix_len : 0;
-  st->prefix_got = 0;
-  st->handler.stream = fn;
-}
-
-static void http2_stream_set_detach(http2_stream_t *st, int detach) {
-  if (st != NULL) {
-    st->detach = detach != 0;
-  }
-}
 
 int32_t http2_stream_id(const http2_stream_t *st) {
   return st != NULL ? st->id : 0;
@@ -1878,19 +1321,11 @@ void *http2_stream_ctx(const http2_stream_t *st) {
 const http2_header_t *http2_stream_headers(const http2_stream_t *st) {
   return st != NULL ? st->headers : NULL;
 }
-
-const uint8_t *http2_prefix(const http2_stream_t *st, size_t *len) {
-  if (st == NULL || st->prefix_len == 0) {
-    if (len != NULL) {
-      *len = 0;
-    }
-    return NULL;
-  }
-  if (len != NULL) {
-    *len = st->prefix_len;
-  }
-  return st->params;
+size_t http2_stream_header_count(const http2_stream_t *st) {
+  return st != NULL ? st->header_count : 0;
 }
+
+
 
 static http2_stream_t *http2_find_stream(http2_session_t *s, int32_t id) {
   if (s == NULL) {
@@ -2021,6 +1456,11 @@ int http2_respond_msg(http2_session_t *s, int32_t sid, const uint8_t *body,
     }
     return http2_send(s, sid, NULL, 0, 1);
   }
+  if (!h2_queue_fits(s, st, len)) {
+    log_error("[h2] respond_msg: stream %d queue limit exceeded", (int)sid);
+    http2_rst_stream(s, sid);
+    return -1;
+  }
   /* The body may point into borrowed assembly/chunk memory, so a copy is
    * transferred to http2_send (freed on full send or reset). */
   uint8_t *copy = malloc(len);
@@ -2075,6 +1515,22 @@ int http2_respond_trailers(http2_session_t *s, int32_t sid,
   return 0;
 }
 
+int http2_respond_msg_ref(http2_session_t *s, int32_t sid, const uint8_t *body,
+                          size_t len, int end_stream) {
+  if (s == NULL || sid <= 0 || (len > 0 && body == NULL)) return -1;
+  h2_require_owner(s);
+  http2_stream_t *st = http2_find_stream(s, sid);
+  if (st == NULL || st->resp_closed || st->trailers != 0) return -1;
+  if (len == 0) return http2_respond_msg(s, sid, NULL, 0, end_stream);
+  if (!st->resp_opened && http2_respond_begin(s, sid, 200, NULL, 0) != 0)
+    return -1;
+  if (http2_send_ex(s, sid, (uint8_t *)body, len, end_stream, 0) != 0) {
+    http2_rst_stream(s, sid);
+    return -1;
+  }
+  return 0;
+}
+
 int http2_respond_msg_owned(http2_session_t *s, int32_t sid, uint8_t *body,
                             size_t len, int end_stream) {
   if (s == NULL || sid <= 0 || (len > 0 && body == NULL)) {
@@ -2113,19 +1569,24 @@ int http2_respond_msg_owned(http2_session_t *s, int32_t sid, uint8_t *body,
   return 0;
 }
 
-static int http2_send(http2_session_t *s, int32_t sid, uint8_t *payload,
-                      size_t len, int end_stream) {
+static int http2_send_ex(http2_session_t *s, int32_t sid, uint8_t *payload,
+                         size_t len, int end_stream, int owned) {
   if (s == NULL || sid <= 0 || (len > 0 && payload == NULL)) {
-    free(payload);
+    if (owned) free(payload);
     return -1;
   }
   http2_stream_t *st = http2_find_stream(s, sid);
   if (st == NULL) {
-    free(payload); /* peer never opened it (or already closed) */
+    if (owned) free(payload);
     return -1;
   }
   if (st->resp_closed || st->trailers != 0) {
     log_error("[h2] send after EOF on stream %d", (int)sid);
+    if (owned) free(payload);
+    return -1;
+  }
+  if (!h2_queue_fits(s, st, len)) {
+    log_error("[h2] stream %d: response queue limit exceeded", (int)sid);
     free(payload);
     return -1;
   }
@@ -2134,13 +1595,17 @@ static int http2_send(http2_session_t *s, int32_t sid, uint8_t *payload,
    * NO_COPY payloads itself). Ownership transfers to the queue. */
   h2_out_t *m = h2_node_alloc();
   if (m == NULL) {
-    free(payload);
+    if (owned) free(payload);
     return -1;
   }
   m->payload = payload;
   m->len = len;
   m->eof = end_stream ? 1 : 0;
+  m->charged = 1;
+  m->owned = owned;
   m->next = NULL;
+  st->queued_bytes += len;
+  s->queued_bytes += len;
   if (st->out_tail != NULL) {
     st->out_tail->next = m;
   } else {
@@ -2160,6 +1625,12 @@ static int http2_send(http2_session_t *s, int32_t sid, uint8_t *payload,
    * otherwise the caller follows with http2_flush(). */
   return 0;
 }
+
+static int http2_send(http2_session_t *s, int32_t sid, uint8_t *payload,
+                      size_t len, int end_stream) {
+  return http2_send_ex(s, sid, payload, len, end_stream, 1);
+}
+
 
 nghttp2_session *http2_raw(http2_session_t *s) {
   if (s == NULL) {
@@ -2186,9 +1657,6 @@ int http2_flush(http2_session_t *s) {
   return 0;
 }
 
-size_t http2_batch_consume_bytes(const http2_batch_t *b) {
-  return b != NULL ? b->consume : 0;
-}
 
 int http2_stream_consume(http2_session_t *s, int32_t sid, size_t n) {
   if (s == NULL || sid <= 0) {
@@ -2201,17 +1669,3 @@ int http2_stream_consume(http2_session_t *s, int32_t sid, size_t n) {
   return http2_flush(s);
 }
 
-int http2_batch_consume(http2_session_t *s, http2_batch_t *b) {
-  if (s == NULL || b == NULL || b->consume == 0) {
-    return 0;
-  }
-  h2_require_owner(s);
-  int rc = h2_consume_stream(s, b->sid, b->consume);
-  if (rc == 0) {
-    b->consume = 0; /* idempotent: never credit the same bytes twice */
-  }
-  if (rc != 0) {
-    return -1;
-  }
-  return http2_flush(s);
-}
